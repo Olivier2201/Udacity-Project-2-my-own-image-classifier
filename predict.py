@@ -1,15 +1,33 @@
 
 import torch
 from torchvision import models
-from torch import nn, optim
+from torch import nn
 from PIL import Image
 import json
 import numpy as np
+import argparse
 
+# Argument parsing for command-line options
+parser = argparse.ArgumentParser(description='Predict the class of an image using a pre-trained model')
+parser.add_argument('image_path', type=str, help='Path to the image file')
+parser.add_argument('checkpoint', type=str, help='Path to the model checkpoint')
+parser.add_argument('--top_k', type=int, default=5, help='Return top K most likely classes')
+parser.add_argument('--category_names', type=str, help='Path to a JSON file mapping categories to real names')
+parser.add_argument('--gpu', action='store_true', help='Use GPU for inference')
+
+args = parser.parse_args()
+
+# Load the checkpoint and rebuild the model
 def load_checkpoint(filepath):
     checkpoint = torch.load(filepath)
-    model = models.vgg16_bn(pretrained=True)
-    model.classifier = checkpoint['classifier']
+    if checkpoint['arch'] == 'vgg16_bn':
+        model = models.vgg16_bn(pretrained=True)
+    elif checkpoint['arch'] == 'resnet18':
+        model = models.resnet18(pretrained=True)
+        model.fc = checkpoint['classifier']
+    else:
+        raise ValueError("Model architecture not recognized. Please use 'vgg16_bn' or 'resnet18'.")
+    
     model.load_state_dict(checkpoint['state_dict'])
     model.class_to_idx = checkpoint['class_to_idx']
     
@@ -17,7 +35,6 @@ def load_checkpoint(filepath):
 
 def process_image(image_path):
     pil_image = Image.open(image_path)
-    
     pil_image = pil_image.resize((256, 256))
     pil_image = pil_image.crop((16, 16, 240, 240))
     
@@ -29,10 +46,10 @@ def process_image(image_path):
 
 def predict(image_path, model, topk=5):
     model.eval()
-    model.to('cuda')
+    model.to('cuda' if args.gpu and torch.cuda.is_available() else 'cpu')
     
     img = process_image(image_path)
-    img = img.unsqueeze(0).to('cuda')
+    img = img.unsqueeze(0).to('cuda' if args.gpu and torch.cuda.is_available() else 'cpu')
     
     with torch.no_grad():
         output = model(img)
@@ -45,11 +62,16 @@ def predict(image_path, model, topk=5):
         return top_p.cpu().numpy()[0], top_class
 
 # Load the model
-model = load_checkpoint('checkpoint.pth')
+model = load_checkpoint(args.checkpoint)
 
 # Predict the class of an image
-image_path = 'flowers/test/1/image_06743.jpg'
-probs, classes = predict(image_path, model)
+probs, classes = predict(args.image_path, model, topk=args.top_k)
+
+# Convert class indices to names if provided
+if args.category_names:
+    with open(args.category_names, 'r') as f:
+        cat_to_name = json.load(f)
+    classes = [cat_to_name[i] for i in classes]
 
 print(probs)
 print(classes)

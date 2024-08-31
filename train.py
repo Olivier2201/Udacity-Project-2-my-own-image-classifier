@@ -3,14 +3,26 @@ import torch
 from torch import nn, optim
 from torchvision import datasets, transforms, models
 import json
+import argparse
 
-# Define the directories for the datasets
-data_dir = 'flowers'
-train_dir = data_dir + '/train'
-valid_dir = data_dir + '/valid'
-test_dir = data_dir + '/test'
+# Argument parsing for command-line options
+parser = argparse.ArgumentParser(description='Train a neural network on a dataset')
+parser.add_argument('--data_dir', type=str, default='flowers', help='Directory containing the dataset')
+parser.add_argument('--save_dir', type=str, default='.', help='Directory to save the model checkpoint')
+parser.add_argument('--arch', type=str, default='vgg16_bn', help='Model architecture: vgg16_bn, resnet18')
+parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for training')
+parser.add_argument('--hidden_units', type=int, default=4096, help='Number of hidden units in classifier')
+parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
+parser.add_argument('--gpu', action='store_true', help='Use GPU for training')
 
-# Define the data transforms
+args = parser.parse_args()
+
+# Load data directories
+train_dir = args.data_dir + '/train'
+valid_dir = args.data_dir + '/valid'
+test_dir = args.data_dir + '/test'
+
+# Define transforms
 train_transforms = transforms.Compose([transforms.RandomRotation(30),
                                        transforms.RandomResizedCrop(224),
                                        transforms.RandomHorizontalFlip(),
@@ -24,75 +36,80 @@ test_transforms = transforms.Compose([transforms.Resize(256),
                                       transforms.Normalize([0.485, 0.456, 0.406], 
                                                            [0.229, 0.224, 0.225])])
 
-# Load the datasets with ImageFolder
+# Load datasets
 train_data = datasets.ImageFolder(train_dir, transform=train_transforms)
 valid_data = datasets.ImageFolder(valid_dir, transform=test_transforms)
 test_data = datasets.ImageFolder(test_dir, transform=test_transforms)
 
-# Define the dataloaders
+# Define dataloaders
 trainloader = torch.utils.data.DataLoader(train_data, batch_size=64, shuffle=True)
 validloader = torch.utils.data.DataLoader(valid_data, batch_size=64)
 testloader = torch.utils.data.DataLoader(test_data, batch_size=64)
 
-# Load a pre-trained network
-model = models.vgg16_bn(pretrained=True)
+# Load model architecture based on user input
+if args.arch == 'vgg16_bn':
+    model = models.vgg16_bn(pretrained=True)
+elif args.arch == 'resnet18':
+    model = models.resnet18(pretrained=True)
+    model.fc = nn.Sequential(nn.Linear(512, args.hidden_units),
+                             nn.ReLU(),
+                             nn.Dropout(0.2),
+                             nn.Linear(args.hidden_units, 102),
+                             nn.LogSoftmax(dim=1))
+else:
+    raise ValueError("Model architecture not recognized. Please choose 'vgg16_bn' or 'resnet18'.")
 
-# Freeze parameters so we don't backprop through them
+# Freeze parameters for pre-trained model
 for param in model.parameters():
     param.requires_grad = False
 
-# Define a new, untrained feed-forward network as a classifier, using ReLU activations and dropout
-classifier = nn.Sequential(nn.Linear(25088, 4096),
-                            nn.ReLU(),
-                            nn.Dropout(0.2),
-                            nn.Linear(4096, 102),
-                            nn.LogSoftmax(dim=1))
+# Define new classifier for VGG
+if args.arch == 'vgg16_bn':
+    model.classifier = nn.Sequential(nn.Linear(25088, args.hidden_units),
+                                     nn.ReLU(),
+                                     nn.Dropout(0.2),
+                                     nn.Linear(args.hidden_units, 102),
+                                     nn.LogSoftmax(dim=1))
 
-model.classifier = classifier
-
-# Define the criterion and optimizer
+# Define criterion and optimizer
 criterion = nn.NLLLoss()
-optimizer = optim.Adam(model.classifier.parameters(), lr=0.001)
+optimizer = optim.Adam(model.classifier.parameters(), lr=args.learning_rate)
 
-# Train the network
-epochs = 3
+# Move model to GPU if available and requested
+device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Training loop
+epochs = args.epochs
 steps = 0
 running_loss = 0
 print_every = 5
 
-model.to('cuda')
-
 for epoch in range(epochs):
-    for inputs, labels in trainloader:
+    for images, labels in trainloader:
         steps += 1
-        
-        # Move input and label tensors to the default device
-        inputs, labels = inputs.to('cuda'), labels.to('cuda')
+        images, labels = images.to(device), labels.to(device)
         
         optimizer.zero_grad()
-        
-        logps = model(inputs)
-        loss = criterion(logps, labels)
+        output = model(images)
+        loss = criterion(output, labels)
         loss.backward()
         optimizer.step()
         
         running_loss += loss.item()
         
         if steps % print_every == 0:
-            model.eval()
             valid_loss = 0
             accuracy = 0
+            model.eval()
             
             with torch.no_grad():
-                for inputs, labels in validloader:
-                    inputs, labels = inputs.to('cuda'), labels.to('cuda')
-                    logps = model(inputs)
-                    batch_loss = criterion(logps, labels)
+                for images, labels in validloader:
+                    images, labels = images.to(device), labels.to(device)
+                    output = model(images)
+                    valid_loss += criterion(output, labels).item()
                     
-                    valid_loss += batch_loss.item()
-                    
-                    # Calculate accuracy
-                    ps = torch.exp(logps)
+                    ps = torch.exp(output)
                     top_p, top_class = ps.topk(1, dim=1)
                     equals = top_class == labels.view(*top_class.shape)
                     accuracy += torch.mean(equals.type(torch.FloatTensor)).item()
@@ -106,9 +123,9 @@ for epoch in range(epochs):
 
 # Save the checkpoint
 model.class_to_idx = train_data.class_to_idx
-checkpoint = {
-    'classifier': model.classifier,
-    'state_dict': model.state_dict(),
-    'class_to_idx': model.class_to_idx
-}
-torch.save(checkpoint, 'checkpoint.pth')
+checkpoint = {'arch': args.arch,
+              'state_dict': model.state_dict(),
+              'class_to_idx': model.class_to_idx,
+              'classifier': model.classifier}
+
+torch.save(checkpoint, args.save_dir + '/checkpoint.pth')
